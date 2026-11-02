@@ -170,20 +170,23 @@ pub fn pseudo_code(ctx: &mut Ctx<'_>, at: At, our_base: u64, params: serde_json:
     }
 }
 
+/// A name Ghidra may use → the person's name for it, and the address (ours) they named.
+type Renames = HashMap<String, (String, u64)>;
+
 /// For each address the person named, the names Ghidra may give it, each with the person's name:
 /// the ones Ghidra makes from its own address (`FUN_00101160`, `DAT_…`, `LAB_…`) and the program's
 /// own symbol, which Ghidra uses too. Our made-up `sub_…` names are left out; Ghidra never uses them.
-fn user_renames(ctx: &mut Ctx<'_>, rebase: ghidra::Rebase) -> HashMap<String, String> {
-    let mut out = HashMap::new();
+fn user_renames(ctx: &mut Ctx<'_>, rebase: ghidra::Rebase) -> Renames {
+    let mut out = Renames::new();
     let Ok(st) = super::native_common::native(ctx) else { return out };
     let Ok(t) = ctx.session.active() else { return out };
     for (&a, name) in &t.annotations.names {
         let theirs = rebase.to_engine(a);
         for prefix in ["FUN", "DAT", "LAB"] {
-            out.entry(format!("{prefix}_{theirs:08x}")).or_insert_with(|| name.clone());
+            out.entry(format!("{prefix}_{theirs:08x}")).or_insert_with(|| (name.clone(), a));
         }
         if let Some(symbol) = st.prog.name_at(a).filter(|n| n != name && !n.starts_with("sub_")) {
-            out.entry(symbol).or_insert_with(|| name.clone());
+            out.entry(symbol).or_insert_with(|| (name.clone(), a));
         }
     }
     out
@@ -272,9 +275,10 @@ fn is_c_name(s: &str) -> bool {
 }
 
 /// The renames that can go into this code, and the person's names that can't: one that isn't a C
-/// name (`handle // note` would turn the rest of a line into a comment), or one that another name
-/// in the code already is (it would then name two things). Only names that appear are considered.
-fn renames_for_code(texts: &[&str], renames: &HashMap<String, String>) -> (HashMap<String, String>, Vec<String>) {
+/// name (`handle // note` would turn the rest of a line into a comment), one that another name in
+/// the code already is, or one the person gave two addresses that both appear here (each would
+/// then name two things). Only names that appear are considered.
+fn renames_for_code(texts: &[&str], renames: &Renames) -> (HashMap<String, String>, Vec<String>) {
     let words: std::collections::HashSet<&str> = texts
         .iter()
         .flat_map(|t| c_pieces(t))
@@ -283,9 +287,16 @@ fn renames_for_code(texts: &[&str], renames: &HashMap<String, String>) -> (HashM
             Piece::Text(_) => None,
         })
         .collect();
+    let present: Vec<(&String, &String, u64)> =
+        renames.iter().filter(|(from, _)| words.contains(from.as_str())).map(|(from, (to, at))| (from, to, *at)).collect();
+    let mut places: HashMap<&str, std::collections::HashSet<u64>> = HashMap::new();
+    for (_, to, at) in &present {
+        places.entry(to.as_str()).or_default().insert(*at);
+    }
     let (mut ok, mut skipped) = (HashMap::new(), Vec::new());
-    for (from, to) in renames.iter().filter(|(from, _)| words.contains(from.as_str())) {
-        if is_c_name(to) && (!words.contains(to.as_str()) || to == from) {
+    for (from, to, _) in present {
+        let one_place = places.get(to.as_str()).is_some_and(|p| p.len() == 1);
+        if is_c_name(to) && one_place && (!words.contains(to.as_str()) || to == from) {
             ok.insert(from.clone(), to.clone());
         } else if !skipped.contains(to) {
             skipped.push(to.clone());
@@ -300,7 +311,7 @@ fn build_evidence(
     provider: &dyn DeepDecompiler,
     df: DeepFunction,
     rebase: ghidra::Rebase,
-    renames: &HashMap<String, String>,
+    renames: &Renames,
     params: serde_json::Value,
 ) -> Result<ToolOutput, ToolError> {
     let subject = ctx.session.active()?.target.subject();
@@ -316,7 +327,7 @@ fn build_evidence(
     let entry = rebase.from_engine(df.entry);
     // The names the person set, in place of Ghidra's own: as set in the function field and the
     // summary, and in the code wherever they can stand as C names.
-    let name = renames.get(&df.name).cloned().unwrap_or_else(|| df.name.clone());
+    let name = renames.get(&df.name).map_or_else(|| df.name.clone(), |(n, _)| n.clone());
     let texts: Vec<&str> = [Some(df.name.as_str()), df.signature.as_deref(), df.pseudocode.as_deref()].into_iter().flatten().collect();
     let (in_code, not_in_code) = renames_for_code(&texts, renames);
     let signature = df.signature.as_deref().map(|s| rename_identifiers(s, &in_code));
@@ -540,6 +551,14 @@ mod tests {
         let r = call(&e, "native_function_pseudocode", json!({"function": "main"}));
         assert_eq!(r["result"]["pseudo_code"], original, "{r}");
         assert!(not_in_code(&r).is_some_and(|m| m.contains("helper_count")), "{r}");
+        // One name given to two addresses that both appear would name two things: left out.
+        call(&e, "native_name_set", json!({"address": helper, "name": "init"}));
+        call(&e, "native_name_set", json!({"address": main, "name": "init"}));
+        let r = call(&e, "native_function_pseudocode", json!({"function": "main"}));
+        assert_eq!(r["result"]["pseudo_code"], original, "{r}");
+        assert_eq!(r["result"]["function"], "init");
+        assert!(not_in_code(&r).is_some_and(|m| m.contains("init")), "{r}");
+        call(&e, "native_name_set", json!({"address": main, "name": ""}));
         // A C keyword isn't a name either.
         call(&e, "native_name_set", json!({"address": helper, "name": "return"}));
         let r = call(&e, "native_function_pseudocode", json!({"function": "main"}));
