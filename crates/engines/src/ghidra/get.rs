@@ -130,7 +130,15 @@ pub fn java_in_use(launcher: &Path, configured: Option<&Path>, inherited: Option
     let props = launcher.parent().map(|d| d.join("launch.properties"));
     let over = props
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|text| text.lines().filter_map(|l| l.trim().strip_prefix("JAVA_HOME_OVERRIDE=")).map(str::trim).rfind(|v| !v.is_empty()).map(PathBuf::from));
+        // `KEY=value`, with or without spaces around the `=`, as Java reads a properties file.
+        .and_then(|text| {
+            text.lines()
+                .filter_map(|l| l.split_once('='))
+                .filter(|(k, _)| k.trim() == "JAVA_HOME_OVERRIDE")
+                .map(|(_, v)| v.trim())
+                .rfind(|v| !v.is_empty())
+                .map(PathBuf::from)
+        });
     if let Some(dir) = over.filter(|d| has_java(d)) {
         return GhidraJava::Override(dir);
     }
