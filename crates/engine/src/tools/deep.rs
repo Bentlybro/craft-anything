@@ -337,18 +337,16 @@ fn build_evidence(
     let entry = rebase.from_engine(df.entry);
     // The names the person set, in place of Ghidra's own: as set in the function field and the
     // summary, and in the code wherever they can stand as C names.
-    // By the function's address first: Ghidra may call it by a symbol the renames leave out (`sub_…`).
-    let name = ctx
-        .session
-        .active()?
-        .annotations
-        .names
-        .get(&entry)
-        .cloned()
-        .or_else(|| renames.get(&df.name).map(|(n, _)| n.clone()))
-        .unwrap_or_else(|| df.name.clone());
+    // By the function's address first: Ghidra may call it by a symbol the renames leave out
+    // (`sub_…`), and then that name of Ghidra's is renamed in the code too.
+    let by_address = ctx.session.active()?.annotations.names.get(&entry).cloned();
+    let mut renames = renames.clone();
+    if let Some(n) = &by_address {
+        renames.entry(df.name.clone()).or_insert_with(|| (n.clone(), entry));
+    }
+    let name = by_address.or_else(|| renames.get(&df.name).map(|(n, _)| n.clone())).unwrap_or_else(|| df.name.clone());
     let texts: Vec<&str> = [Some(df.name.as_str()), df.signature.as_deref(), df.pseudocode.as_deref()].into_iter().flatten().collect();
-    let (in_code, not_in_code) = renames_for_code(&texts, renames);
+    let (in_code, not_in_code) = renames_for_code(&texts, &renames);
     let signature = df.signature.as_deref().map(|s| rename_identifiers(s, &in_code));
     let pseudocode = df.pseudocode.as_deref().map(|p| rename_identifiers(p, &in_code));
     let renamed = name != df.name || signature != df.signature || pseudocode != df.pseudocode;
@@ -616,6 +614,7 @@ mod tests {
         let r = call(&e, "native_function_pseudocode", json!({"function": "parse_args"}));
         assert_eq!(r["result"]["function"], "parse_args", "{r}");
         assert_eq!(r["summary"], "Pseudo-C for parse_args from the Deep engine (1 lines).");
+        assert_eq!(r["result"]["pseudo_code"], "int parse_args(void) { return 0; }", "and in the code");
     }
 
     #[test]
