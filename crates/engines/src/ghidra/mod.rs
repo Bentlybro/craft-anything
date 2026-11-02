@@ -326,6 +326,69 @@ pub fn project_cache_dir(store: &Path, target_sha256: &str, settings_hash: &str)
     store.join("ghidra-cache").join(key)
 }
 
+/// The folder to give Ghidra for the engine store. Ghidra refuses a project path with a part that
+/// starts with a dot ("Path element starting with '.' is not permitted"), and the default store on
+/// Linux is under `~/.config`. Then Ghidra gets a dot-free link to the store, so the analyses it
+/// saves still land in the store and are found again next time.
+fn ghidra_root(store: &Path) -> Result<PathBuf, GhidraError> {
+    if !has_dot_part(store) {
+        return Ok(store.to_path_buf());
+    }
+    #[cfg(unix)]
+    if let Some(link) = dot_free_link(store)? {
+        return Ok(link);
+    }
+    Ok(store.to_path_buf())
+}
+
+/// Whether a part of `p` starts with a dot, which Ghidra refuses in a project path.
+fn has_dot_part(p: &Path) -> bool {
+    p.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+}
+
+/// A link to `store` in a private folder of this user in the runtime folder (`XDG_RUNTIME_DIR`)
+/// or the temp folder, one per store. `None` when those have a dot part too.
+#[cfg(unix)]
+fn dot_free_link(store: &Path) -> Result<Option<PathBuf>, GhidraError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let launch = |what: &str, e: std::io::Error| GhidraError::Launch(format!("{what}: {e}"));
+    let store = std::path::absolute(store).map_err(|e| launch("finding the engine store", e))?;
+    make_private_dir(&store)?;
+    let owner = std::fs::metadata(&store).map_err(|e| launch("reading the engine store", e))?.uid();
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|p| p.is_absolute() && !has_dot_part(p)).unwrap_or_else(std::env::temp_dir);
+    if !base.is_absolute() || has_dot_part(&base) {
+        return Ok(None);
+    }
+    let dir = base.join(format!("craft-anything-{owner}"));
+    make_private_dir(&dir)?;
+    // In a shared temp folder, a folder someone else made (or a link to one) isn't ours to use.
+    let meta = std::fs::symlink_metadata(&dir).map_err(|e| launch("checking the link folder", e))?;
+    if !meta.is_dir() || meta.uid() != owner || meta.permissions().mode() & 0o077 != 0 {
+        return Err(GhidraError::Launch(format!(
+            "{} isn't a private folder of yours, so Ghidra can't be given a path to the engine store without a dot folder",
+            dir.display()
+        )));
+    }
+    let key = craft_anything_evidence::sha256_hex(store.as_os_str().as_encoded_bytes());
+    let link = dir.join(format!("engines-{}", key.get(..16).unwrap_or(&key)));
+    // Two processes can make the link at once: whoever loses checks the one the other made.
+    for _ in 0..2 {
+        match std::fs::read_link(&link) {
+            Ok(to) if to == store => return Ok(Some(link)),
+            Ok(_) => {
+                let _ = std::fs::remove_file(&link);
+            }
+            Err(_) => {}
+        }
+        match std::os::unix::fs::symlink(&store, &link) {
+            Ok(()) => return Ok(Some(link)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(launch("linking the engine store", e)),
+        }
+    }
+    Err(GhidraError::Launch(format!("{} is in the way of the link to the engine store", link.display())))
+}
+
 /// Create a fresh private directory under `base`.
 fn private_dir(base: &Path, prefix: &str) -> Result<PathBuf, GhidraError> {
     let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
@@ -439,7 +502,9 @@ fn lock_is_fresh(lock: &Path) -> bool {
 
 /// Make sure the target is analysed and saved in its cached project, analysing it now if no one
 /// has (a big program can take hours; it happens once). If another process is already analysing
-/// it, wait for that instead of starting over. Returns the cached project folder.
+/// it, wait for that instead of starting over. Returns the cached project folder, as the path to
+/// give Ghidra: through the store's dot-free link when the store is under a dot folder
+/// ([`ghidra_root`]), so the same folder, not always the same path.
 pub fn analyse(
     cfg: &Config,
     target_bytes: &[u8],
@@ -451,10 +516,11 @@ pub fn analyse(
     let started = Instant::now();
     let minutes = || started.elapsed().as_secs() / 60;
     let deadline = started + cfg.startup_timeout;
-    let project_dir = project_cache_dir(&cfg.store_dir, target_sha256, settings_hash);
+    let root = ghidra_root(&cfg.store_dir)?;
+    let project_dir = project_cache_dir(&root, target_sha256, settings_hash);
     let lock = lock_path(&project_dir);
     // The lock sits beside the project, in the cache folder a fresh store doesn't have yet.
-    make_private_dir(lock.parent().unwrap_or(&cfg.store_dir))?;
+    make_private_dir(lock.parent().unwrap_or(&root))?;
     loop {
         if is_analysed(&project_dir) {
             return Ok(project_dir);
@@ -481,7 +547,7 @@ pub fn analyse(
         }
     }
     let held = HeldLock(lock.clone());
-    let scratch = Scratch::new(&cfg.store_dir, "ghidra-analysis")?;
+    let scratch = Scratch::new(&root, "ghidra-analysis")?;
     let program = format!("target-{}", target_sha256.get(..12).unwrap_or(target_sha256));
     // Beside the saved analysis, so it can be read after a failure.
     let log = project_dir.with_extension("log");
@@ -523,7 +589,11 @@ pub fn analyse(
     match done {
         Ok(true) => write_atomic_private(&project_dir.join(ANALYSED_MARKER), program.as_bytes())
             .map_err(|e| GhidraError::Launch(format!("saving the analysis: {e}")))?,
-        Ok(false) => return Err(GhidraError::Launch(format!("Ghidra's analysis failed; see {}", log.display()))),
+        Ok(false) => {
+            // The log as it is in the store, not through the link Ghidra was given.
+            let shown = project_cache_dir(&cfg.store_dir, target_sha256, settings_hash).with_extension("log");
+            return Err(GhidraError::Launch(format!("Ghidra's analysis failed; see {}", shown.display())));
+        }
         Err(m) => return Err(GhidraError::Timeout(m)),
     }
     drop(held);
@@ -544,7 +614,7 @@ impl Session {
         let run_id = random_token();
         let token = random_token();
         let project_dir = analyse(cfg, target_bytes, target_sha256, settings_hash, cancel, progress)?;
-        let scratch = Scratch::new(&cfg.store_dir, "ghidra-runtime")?;
+        let scratch = Scratch::new(&ghidra_root(&cfg.store_dir)?, "ghidra-runtime")?;
         let runtime_root = scratch.0.clone();
         let program = format!("target-{}", target_sha256.get(..12).unwrap_or(target_sha256));
         let log = runtime_root.join("ghidra.log");

@@ -294,6 +294,34 @@ fn ghidra_memory_follows_the_setting_within_its_bounds() {
 }
 
 #[test]
+fn a_dot_free_store_is_given_to_ghidra_as_it_is() {
+    let store = Path::new("/home/u/craft-anything/engines");
+    assert_eq!(ghidra_root(store).unwrap(), store);
+    assert!(has_dot_part(Path::new("/home/u/.config/craft-anything/engines")));
+    assert!(!has_dot_part(store));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_under_a_dot_folder_reaches_ghidra_through_a_dot_free_link() {
+    let home = tempfile::tempdir().unwrap();
+    let store = home.path().join(".config").join("craft-anything").join("engines");
+    let root = ghidra_root(&store).unwrap();
+    assert!(!has_dot_part(&root), "{}", root.display());
+    assert!(!has_dot_part(&project_cache_dir(&root, &"ab".repeat(32), &"cd".repeat(32))));
+    // It is the store: what Ghidra saves there is in the store, and the next run finds the same link.
+    std::fs::write(root.join("saved"), "x").unwrap();
+    assert!(store.join("saved").is_file());
+    assert_eq!(ghidra_root(&store).unwrap(), root);
+    // A link left pointing elsewhere is replaced.
+    std::fs::remove_file(&root).unwrap();
+    std::os::unix::fs::symlink(home.path(), &root).unwrap();
+    assert_eq!(ghidra_root(&store).unwrap(), root);
+    assert_eq!(std::fs::read_link(&root).unwrap(), store);
+    let _ = std::fs::remove_file(&root);
+}
+
+#[test]
 fn project_cache_dir_is_keyed_and_dot_free() {
     let dir = project_cache_dir(Path::new("/store"), &"ab".repeat(32), &"cd".repeat(32));
     let s = dir.to_string_lossy();
@@ -315,7 +343,9 @@ fn a_second_analysis_waits_for_the_running_one_and_a_dead_ones_lock_is_taken_ove
         memory_gb: None,
     };
     let (sha, digest) = ("ab".repeat(32), "cd".repeat(32));
-    let project = project_cache_dir(d.path(), &sha, &digest);
+    // A temp folder can be under a dot folder (`/tmp/.tmpXXXX`): the project is then reached
+    // through the store's link, which is the path analyse() gives back.
+    let project = project_cache_dir(&ghidra_root(d.path()).unwrap(), &sha, &digest);
     std::fs::create_dir_all(project.parent().unwrap()).unwrap();
 
     // Someone is analysing (a fresh lock); their result appears a moment later.
