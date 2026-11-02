@@ -154,14 +154,7 @@ pub fn doctor(host: &Host, req: &DoctorRequest) -> DoctorReport {
 
     // Optional engines.
     if req.engines {
-        let settings = craft_anything_engine::Settings::load();
-        for e in craft_anything_engines::ENGINES {
-            let name = format!("engine:{}", e.id);
-            checks.push(match settings.engine_path(e.id) {
-                Some(p) => Check::new(name, CheckStatus::Ok, format!("{}: {}", e.name, p.display())),
-                None => Check::new(name, CheckStatus::Info, format!("{} not found (optional; {}).", e.name, e.needed_for)),
-            });
-        }
+        checks.extend(engine_checks(&craft_anything_engine::Settings::load()));
     }
 
     // MCP self-test.
@@ -174,6 +167,32 @@ pub fn doctor(host: &Host, req: &DoctorRequest) -> DoctorReport {
     checks.extend(req.extra.iter().cloned());
     let healthy = !checks.iter().any(|c| c.status == CheckStatus::Fail);
     DoctorReport { healthy, checks }
+}
+
+/// One check per optional engine, and, when Ghidra is found, which Java it runs on: the one set for
+/// it (`engines.ghidra.java_home`, or the managed one), which needn't be the Java on PATH that
+/// `engine:java` reports.
+fn engine_checks(settings: &craft_anything_engine::Settings) -> Vec<Check> {
+    let mut checks = Vec::new();
+    for e in craft_anything_engines::ENGINES {
+        let name = format!("engine:{}", e.id);
+        checks.push(match settings.engine_path(e.id) {
+            Some(p) => Check::new(name, CheckStatus::Ok, format!("{}: {}", e.name, p.display())),
+            None => Check::new(name, CheckStatus::Info, format!("{} not found (optional; {}).", e.name, e.needed_for)),
+        });
+    }
+    if settings.ghidra_launcher().is_some() {
+        let name = "engine:ghidra-java";
+        checks.push(match (settings.ghidra_java(), settings.engine_path("java")) {
+            (Some(home), _) => Check::new(name, CheckStatus::Ok, format!("Ghidra runs on the Java in {}.", home.display())),
+            (None, Some(_)) => {
+                Check::new(name, CheckStatus::Info, "No Java is set for Ghidra, so it looks for its own (it needs a recent one; see engine:java).")
+            }
+            (None, None) => Check::new(name, CheckStatus::Warn, "Ghidra is installed but no Java was found for it.")
+                .fix("Set Ghidra's Java folder in Settings → Engines, or install Java 21 or newer."),
+        });
+    }
+    checks
 }
 
 /// Start an MCP server over stdio, send `initialize` + `initialized` + `tools/list`, close stdin,
@@ -235,6 +254,42 @@ pub fn mcp_self_test(program: &str, args: &[String], timeout: Duration) -> Check
         return Check::new(name, CheckStatus::Fail, format!("The MCP server's tool list is missing {session}."));
     }
     Check::new(name, CheckStatus::Ok, format!("MCP server answered (protocol {protocol}, {} tools listed).", tools.len()))
+}
+
+#[cfg(test)]
+mod engine_check_tests {
+    use super::*;
+
+    fn ghidra_java(checks: &[Check]) -> Option<&Check> {
+        checks.iter().find(|c| c.name == "engine:ghidra-java")
+    }
+
+    #[test]
+    fn doctor_names_the_java_ghidra_runs_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = craft_anything_engine::Settings::default();
+        s.engines.store_dir = Some(dir.path().join("engines"));
+        s.engines.only_configured = true;
+        assert!(ghidra_java(&engine_checks(&s)).is_none(), "nothing to say without Ghidra");
+
+        let ghidra = dir.path().join("ghidra");
+        std::fs::create_dir_all(ghidra.join("support")).unwrap();
+        std::fs::write(ghidra.join("support").join(if cfg!(windows) { "analyzeHeadless.bat" } else { "analyzeHeadless" }), "").unwrap();
+        s.engines.ghidra.install_dir = Some(ghidra);
+        let c = engine_checks(&s);
+        let check = ghidra_java(&c).expect("a check once Ghidra is found");
+        assert_eq!(check.status, CheckStatus::Warn, "{check:?}");
+
+        let jdk = dir.path().join("jdk-25");
+        std::fs::create_dir_all(jdk.join("bin")).unwrap();
+        s.engines.ghidra.java_home = Some(jdk.clone());
+        let c = engine_checks(&s);
+        let check = ghidra_java(&c).unwrap();
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains(&jdk.display().to_string()), "{}", check.message);
+        // engine:java still reports the Java on PATH (here: none, as only configured paths count).
+        assert!(c.iter().any(|x| x.name == "engine:java" && x.status == CheckStatus::Info));
+    }
 }
 
 #[cfg(all(test, unix))]
