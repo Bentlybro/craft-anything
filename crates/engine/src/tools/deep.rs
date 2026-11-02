@@ -14,6 +14,7 @@ use crate::settings::Settings;
 use crate::tool::{Ctx, ToolOutput};
 use craft_anything_engines::ghidra::{self, DeepDecompiler, DeepFunction};
 use craft_anything_evidence::{Confidence, Environment, EvidenceBuilder, Limitation, Location, ToolError, host_triple};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -142,7 +143,10 @@ pub fn pseudo_code(ctx: &mut Ctx<'_>, at: At, our_base: u64, params: serde_json:
         At::Engine(a) => a,
     };
     match provider.decompile(entry) {
-        Ok(Some(df)) => Ok(build_evidence(ctx, provider.as_ref(), df, rebase, params)),
+        Ok(Some(df)) => {
+            let renames = user_renames(ctx, rebase);
+            Ok(build_evidence(ctx, provider.as_ref(), df, rebase, &renames, params))
+        }
         Ok(None) => Err(Some("Ghidra had no answer for this function.".into())),
         Err(ghidra::GhidraError::Cancelled) => Ok(Err(ToolError::cancelled())),
         Err(e) => {
@@ -166,11 +170,72 @@ pub fn pseudo_code(ctx: &mut Ctx<'_>, at: At, our_base: u64, params: serde_json:
     }
 }
 
+/// For each address the person named, the names Ghidra may give it, each with the person's name:
+/// the ones Ghidra makes from its own address (`FUN_00101160`, `DAT_…`, `LAB_…`) and the program's
+/// own symbol, which Ghidra uses too. Our made-up `sub_…` names are left out; Ghidra never uses them.
+fn user_renames(ctx: &mut Ctx<'_>, rebase: ghidra::Rebase) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(st) = super::native_common::native(ctx) else { return out };
+    let Ok(t) = ctx.session.active() else { return out };
+    for (&a, name) in &t.annotations.names {
+        let theirs = rebase.to_engine(a);
+        for prefix in ["FUN", "DAT", "LAB"] {
+            out.entry(format!("{prefix}_{theirs:08x}")).or_insert_with(|| name.clone());
+        }
+        if let Some(symbol) = st.prog.name_at(a).filter(|n| n != name && !n.starts_with("sub_")) {
+            out.entry(symbol).or_insert_with(|| name.clone());
+        }
+    }
+    out
+}
+
+/// `code` with every whole identifier that is a key of `renames` replaced by its value
+/// (`check_key` is replaced; `check_key_v2`, `my_check_key` and the text of a string or character
+/// literal aren't).
+fn rename_identifiers(code: &str, renames: &HashMap<String, String>) -> String {
+    if renames.is_empty() {
+        return code.to_string();
+    }
+    let mut out = String::with_capacity(code.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        out.push_str(renames.get(word.as_str()).map_or(word.as_str(), String::as_str));
+        word.clear();
+    };
+    // Inside a literal: its quote, and whether the last character was an escaping backslash.
+    let mut literal: Option<(char, bool)> = None;
+    for c in code.chars() {
+        if let Some((quote, escaped)) = literal {
+            out.push(c);
+            literal = if escaped {
+                Some((quote, false))
+            } else if c == '\\' {
+                Some((quote, true))
+            } else if c == quote {
+                None
+            } else {
+                Some((quote, false))
+            };
+        } else if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+            if c == '"' || c == '\'' {
+                literal = Some((c, false));
+            }
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 fn build_evidence(
     ctx: &Ctx<'_>,
     provider: &dyn DeepDecompiler,
     df: DeepFunction,
     rebase: ghidra::Rebase,
+    renames: &HashMap<String, String>,
     params: serde_json::Value,
 ) -> Result<ToolOutput, ToolError> {
     let subject = ctx.session.active()?.target.subject();
@@ -184,11 +249,16 @@ fn build_evidence(
     let line_count = df.pseudocode.as_deref().map(|p| p.lines().count()).unwrap_or(0);
     // The entry as every other tool gives it; Ghidra's own only when it differs.
     let entry = rebase.from_engine(df.entry);
+    // The names the person set, in place of Ghidra's own.
+    let name = rename_identifiers(&df.name, renames);
+    let signature = df.signature.as_deref().map(|s| rename_identifiers(s, renames));
+    let pseudocode = df.pseudocode.as_deref().map(|p| rename_identifiers(p, renames));
+    let renamed = name != df.name || signature != df.signature || pseudocode != df.pseudocode;
     let mut result = serde_json::json!({
-        "function": df.name,
+        "function": name,
         "entry": format!("{entry:#x}"),
-        "signature": df.signature,
-        "pseudo_code": df.pseudocode,
+        "signature": signature,
+        "pseudo_code": pseudocode,
         "engine": provider.engine(),
     });
     if !rebase.is_identity() {
@@ -197,7 +267,7 @@ fn build_evidence(
     let mut e = EvidenceBuilder::new("native_function_pseudocode", subject, env)
         .params(params)
         .result(result)
-        .summary(format!("Pseudo-C for {} from the Deep engine ({line_count} lines).", df.name))
+        .summary(format!("Pseudo-C for {name} from the Deep engine ({line_count} lines)."))
         // Deep decompilation is derived by a mature external engine: stronger than the built-in
         // inferred lifter, but still a reading aid rather than source.
         .confidence(Confidence::Derived)
@@ -212,6 +282,12 @@ fn build_evidence(
                 rebase.theirs(),
                 rebase.ours(),
             ),
+        ));
+    }
+    if renamed {
+        e = e.limitation(Limitation::new(
+            "user_names_applied",
+            "the names you set replace Ghidra's own in this pseudo-C, matched by the name Ghidra gives each address (its FUN_/DAT_/LAB_ name or the program's symbol)",
         ));
     }
     if df.created {
@@ -288,6 +364,92 @@ mod tests {
         let r = call(&e, "native_function_pseudocode", json!({"function": ghidra_name}));
         assert_eq!(moved.asked.load(Ordering::SeqCst), l.code_va + SHIFT + 0x7a00);
         assert_eq!(r["result"]["entry"], format!("{:#x}", l.code_va + 0x7a00));
+    }
+
+    /// A deep engine at our base that gives the same answer for every function: Ghidra's view of
+    /// `main`, calling `helper` by its symbol.
+    struct Symbols;
+
+    impl DeepDecompiler for Symbols {
+        fn engine(&self) -> &'static str {
+            "ghidra"
+        }
+        fn engine_version(&self) -> Option<String> {
+            Some("test".into())
+        }
+        fn image_base(&self) -> Option<u64> {
+            Some(tk::ELF_BASE)
+        }
+        fn decompile(&self, entry: u64) -> Result<Option<DeepFunction>, ghidra::GhidraError> {
+            let pseudocode = Some(
+                "int main(void) {
+  return helper(5) + helper_count + my_helper();
+}"
+                .into(),
+            );
+            Ok(Some(DeepFunction { entry, name: "main".into(), signature: Some("int main(void)".into()), pseudocode, created: false }))
+        }
+        fn list_functions(&self) -> Result<Vec<DeepFunction>, ghidra::GhidraError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn with_deep(e: &crate::Engine, provider: Arc<dyn DeepDecompiler>) {
+        let mut s = e.session();
+        s.settings.deep_mode = true;
+        s.active_mut().unwrap().ext.insert(Arc::new(DeepSlot { provider: Ok(provider) }));
+    }
+
+    #[test]
+    fn ghidra_pseudo_code_uses_the_names_the_person_set_for_its_own_names() {
+        let (elf, l) = tk::elf64(tk::ElfArch::X86_64, true);
+        let e = engine_with("prog", &elf);
+        const SHIFT: u64 = 0x10_0000;
+        with_deep(&e, Arc::new(Moved { base: tk::ELF_BASE + SHIFT, asked: AtomicU64::new(0) }));
+        call(&e, "native_name_set", json!({"address": format!("{:#x}", l.code_va), "name": "start_here"}));
+        // Ghidra calls it FUN_<its own address>: that name is replaced, in the code too.
+        for asked in ["main", "start_here"] {
+            let r = call(&e, "native_function_pseudocode", json!({"function": asked}));
+            assert_eq!(r["environment"]["engine"], "ghidra", "{r}");
+            assert_eq!(r["result"]["function"], "start_here", "{r}");
+            assert_eq!(r["result"]["pseudo_code"], "int start_here(void) { return 0; }");
+            assert_eq!(r["summary"], "Pseudo-C for start_here from the Deep engine (1 lines).");
+            assert!(r["limitations"].as_array().unwrap().iter().any(|x| x["code"] == "user_names_applied"), "{r}");
+        }
+    }
+
+    #[test]
+    fn ghidra_pseudo_code_uses_the_names_the_person_set_for_the_programs_symbols() {
+        let (elf, _) = tk::elf64(tk::ElfArch::X86_64, true);
+        let e = engine_with("prog", &elf);
+        with_deep(&e, Arc::new(Symbols));
+        let helper = call(&e, "native_function_show", json!({"function": "helper"}))["result"]["entry"].as_str().unwrap().to_string();
+        let r = call(&e, "native_function_pseudocode", json!({"function": "main"}));
+        assert!(!r["limitations"].as_array().unwrap().iter().any(|x| x["code"] == "user_names_applied"), "nothing named yet: {r}");
+        call(&e, "native_name_set", json!({"address": helper, "name": "add_up"}));
+        let r = call(&e, "native_function_pseudocode", json!({"function": "main"}));
+        // Whole names only: `helper_count` and `my_helper` are other names.
+        assert_eq!(
+            r["result"]["pseudo_code"],
+            "int main(void) {
+  return add_up(5) + helper_count + my_helper();
+}",
+            "{r}"
+        );
+        assert_eq!(r["result"]["function"], "main");
+    }
+
+    #[test]
+    fn identifiers_are_renamed_whole() {
+        let renames: HashMap<String, String> = [("check_key".to_string(), "verify".to_string()), ("FUN_00101160".to_string(), "go".to_string())].into();
+        assert_eq!(
+            rename_identifiers("if (check_key(x) && check_key_v2() && !my_check_key) FUN_00101160(\"check_key\");", &renames),
+            "if (verify(x) && check_key_v2() && !my_check_key) go(\"check_key\");"
+        );
+        assert_eq!(rename_identifiers("check_key", &renames), "verify");
+        assert_eq!(rename_identifiers(r#"puts("a \" check_key"); c = '\''; check_key();"#, &renames), r#"puts("a \" check_key"); c = '\''; verify();"#);
+        assert_eq!(rename_identifiers("", &renames), "");
+        assert_eq!(rename_identifiers("été check_key", &renames), "été verify");
     }
 
     #[test]
