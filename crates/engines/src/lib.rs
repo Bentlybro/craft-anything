@@ -47,6 +47,15 @@ pub fn display_name(id: &str) -> &'static str {
 /// Find an engine: user override, then the managed store (`<store>/<id>/bin/<exe>`), then PATH,
 /// then its standard install folders.
 pub fn locate(id: &str, overrides: &dyn ToolPathLookup, store: &Path) -> Option<PathBuf> {
+    locate_configured(id, overrides, store).or_else(|| {
+        let e = engine(id)?;
+        find_on_path(e.host_exes()).or_else(|| e.known_install_paths().into_iter().find(|p| p.is_file()))
+    })
+}
+
+/// Find an engine where the settings or the managed store say only: what [`locate`] finds before
+/// it looks around the computer (PATH and standard install folders).
+pub fn locate_configured(id: &str, overrides: &dyn ToolPathLookup, store: &Path) -> Option<PathBuf> {
     if let Some(p) = overrides.override_for(id)
         && p.exists()
     {
@@ -65,7 +74,7 @@ pub fn locate(id: &str, overrides: &dyn ToolPathLookup, store: &Path) -> Option<
             return Some(store.join(id).join(name));
         }
     }
-    find_on_path(exes).or_else(|| e.known_install_paths().into_iter().find(|p| p.is_file()))
+    None
 }
 
 /// An executable in a managed install folder: `<dir>/<exe>`, `<dir>/bin/<exe>` or

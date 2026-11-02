@@ -28,6 +28,14 @@ pub fn can_install() -> bool {
 /// Ghidra's headless launcher: in the folder the person picked (Ghidra's own folder, or one that
 /// holds it), then the managed install, then PATH, then where system packages put it.
 pub fn headless(install_dir: Option<&Path>, store: &Path) -> Option<PathBuf> {
+    headless_configured(install_dir, store)
+        .or_else(|| crate::find_on_path(&["analyzeHeadless.bat", "analyzeHeadless"]))
+        .or_else(|| crate::well_known(ID).into_iter().find(|p| p.is_file()))
+}
+
+/// Ghidra's headless launcher in the folder the person picked or the managed install only: what
+/// [`headless`] finds before it looks around the computer.
+pub fn headless_configured(install_dir: Option<&Path>, store: &Path) -> Option<PathBuf> {
     if let Some(dir) = install_dir {
         if dir.is_file() {
             return Some(dir.to_path_buf());
@@ -37,8 +45,6 @@ pub fn headless(install_dir: Option<&Path>, store: &Path) -> Option<PathBuf> {
         }
     }
     in_child(&store.join(ID), launcher)
-        .or_else(|| crate::find_on_path(&["analyzeHeadless.bat", "analyzeHeadless"]))
-        .or_else(|| crate::well_known(ID).into_iter().find(|p| p.is_file()))
 }
 
 /// The Java runtime to run Ghidra with: the one the person set, else the managed one. `None` lets

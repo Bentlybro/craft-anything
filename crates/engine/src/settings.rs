@@ -76,6 +76,11 @@ pub struct EngineSettings {
     pub store_dir: Option<PathBuf>,
     /// URL of a user-run JEB MCP server, e.g. `http://127.0.0.1:8425/mcp` (loopback, plain HTTP only).
     pub jeb_url: Option<String>,
+    /// Find engines only where these settings and the managed store say, never on PATH or in the
+    /// usual install folders. Never saved: test sessions set it so they don't find what this
+    /// computer has installed ([`crate::testing::session`]).
+    #[serde(skip)]
+    pub only_configured: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -377,7 +382,12 @@ impl Settings {
 
     /// Ghidra's headless launcher, when Deep mode can really use Ghidra (`None`: not installed).
     pub fn ghidra_launcher(&self) -> Option<PathBuf> {
-        craft_anything_engines::ghidra::get::headless(self.engines.ghidra.install_dir.as_deref(), &self.engine_store_dir())
+        let (dir, store) = (self.engines.ghidra.install_dir.as_deref(), self.engine_store_dir());
+        if self.engines.only_configured {
+            craft_anything_engines::ghidra::get::headless_configured(dir, &store)
+        } else {
+            craft_anything_engines::ghidra::get::headless(dir, &store)
+        }
     }
 
     /// The Java runtime Ghidra runs on (`None`: let Ghidra find its own).
@@ -394,7 +404,11 @@ impl Settings {
         if id == craft_anything_engines::ghidra::get::ID {
             return self.ghidra_launcher();
         }
-        craft_anything_engines::locate(id, &self.engines.tools, &self.engine_store_dir())
+        if self.engines.only_configured {
+            craft_anything_engines::locate_configured(id, &self.engines.tools, &self.engine_store_dir())
+        } else {
+            craft_anything_engines::locate(id, &self.engines.tools, &self.engine_store_dir())
+        }
     }
 }
 
@@ -416,6 +430,39 @@ auto_mode = true
     }
 
     use super::*;
+
+    #[test]
+    fn only_configured_finds_no_engine_from_this_computer_but_keeps_the_ones_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.engines.store_dir = Some(dir.path().join("engines"));
+        s.engines.only_configured = true;
+        assert_eq!(s.ghidra_launcher(), None, "PATH and the usual install folders aren't searched");
+        assert_eq!(s.engine_path("java"), None);
+        // The folder the person picked still counts, and so does the managed store.
+        let launcher_name = if cfg!(windows) { "analyzeHeadless.bat" } else { "analyzeHeadless" };
+        let picked = dir.path().join("picked").join("ghidra_12_PUBLIC");
+        std::fs::create_dir_all(picked.join("support")).unwrap();
+        std::fs::write(picked.join("support").join(launcher_name), "").unwrap();
+        s.engines.ghidra.install_dir = Some(dir.path().join("picked"));
+        assert_eq!(s.ghidra_launcher(), Some(picked.join("support").join(launcher_name)));
+        assert_eq!(s.engine_path("ghidra"), s.ghidra_launcher());
+        s.engines.ghidra.install_dir = None;
+        let managed = dir.path().join("engines").join("ghidra").join("ghidra_12_PUBLIC").join("support");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join(launcher_name), "").unwrap();
+        assert_eq!(s.ghidra_launcher(), Some(managed.join(launcher_name)));
+        // It is never written to config.toml, and a loaded config looks around the computer.
+        let text = toml::to_string_pretty(&s).unwrap();
+        assert!(!text.contains("only_configured"), "{text}");
+        let loaded: Settings = toml::from_str(&text).unwrap();
+        assert!(!loaded.engines.only_configured);
+    }
+
+    #[test]
+    fn the_test_session_looks_only_where_its_settings_say() {
+        assert!(crate::testing::session().settings.engines.only_configured);
+    }
 
     #[test]
     fn path_overrides_match_the_engine_table_exactly() {

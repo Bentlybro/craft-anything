@@ -16,9 +16,12 @@ pub fn temp_dir() -> PathBuf {
 
 /// A session whose config, plugin caches, engine store and projects live in a fresh temp folder.
 /// It is in Deep mode, so tools may look inside the sample targets tests open; a test of Clean room
-/// turns `deep_mode` off.
+/// turns `deep_mode` off. It finds no engine this computer has on PATH or in the usual install
+/// folders (`engines.only_configured`), so a test behaves the same whether Ghidra or adb is
+/// installed; a test that needs an engine points the settings or the store at one.
 pub fn session() -> Session {
     let mut s = Session::isolated(&temp_dir());
     s.settings.deep_mode = true;
+    s.settings.engines.only_configured = true;
     s
 }

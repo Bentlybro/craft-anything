@@ -71,6 +71,10 @@ before running anything, and run new tests on a machine without the program.
 It happened again when Clean room began refusing tools before their program is looked for: a
 "missing adb" test returned early on a machine with adb and failed in CI without it. A test of
 what happens without a program builds its session in the mode the tool runs in.
+It happened a third time with Ghidra: the test session's engine store was empty, but the lookup
+still searched PATH, `~/.local/bin` and `/opt/ghidra`, so two Deep-mode tests got Ghidra's answer
+on a machine that had it. `testing::session()` now sets `engines.only_configured`, so it finds only
+the engines its settings or store name.
 
 **A failing crate hid the next crate's tests.** `cargo test -p a -p b` stopped after a failure in
 `a`, so `b`'s tests never ran; the rerun was filtered to the failing test, and a broken engine id
