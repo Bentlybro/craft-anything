@@ -818,7 +818,12 @@ fn scan_function(ctx: &Ctx<'_>, entry: u64, known: &BTreeSet<u64>) -> Scan {
                     if let Some(name) = ctx.stubs.get(&target).filter(|_| a == first) {
                         sc.thunk_of = Some(name.clone());
                     }
-                    if target != entry && (known.contains(&target) || !img.is_exec(target)) {
+                    // An unconditional jump below the entry, to code this function hasn't
+                    // reached another way, leaves it: a tail call to a function nothing else
+                    // names (a stripped program's `frame_dummy` jumping to `register_tm_clones`,
+                    // or a jump to a `.cold` part). Its target is analysed as a function of its own.
+                    let below = target < entry && !sc.leaders.contains(&target);
+                    if target != entry && (known.contains(&target) || !img.is_exec(target) || below) {
                         sc.tails.push(target);
                     } else {
                         sc.leaders.insert(target);
@@ -1304,6 +1309,36 @@ mod tests {
         assert_eq!(p.function_containing(l.code_va + 0x45).unwrap().entry, helper.entry);
         let asm = p.instructions(&img, main, true);
         assert_eq!(asm.first().unwrap().text(), "push rbp");
+    }
+
+    #[test]
+    fn a_jump_below_the_entry_is_a_tail_call_to_a_function_of_its_own() {
+        // `start` (the entry point) at 0x1000; an unnamed function at 0x1010 with no prologue
+        // (`lea rax, [rip]; ret`) that nothing calls; `thunk` at 0x1020 (`endbr64; jmp 0x1010`).
+        let below = vec![0x48, 0x8d, 0x05, 0x00, 0x00, 0x00, 0x00, 0xc3];
+        let thunk = vec![0xf3, 0x0f, 0x1e, 0xfa, 0xe9, 0xe7, 0xff, 0xff, 0xff];
+        let (_, p) = analyze(tk::program_facts::elf_with_functions(&[("start", vec![0xc3]), ("", below), ("thunk", thunk)]));
+        let t = p.function_by_name("thunk").unwrap();
+        assert_eq!(t.size(), 9, "{:?}", t.blocks);
+        assert_eq!(t.tail_calls, [0x1010]);
+        let f = p.functions.get(&0x1010).expect("the jump target is a function");
+        assert_eq!(f.size(), 8);
+        assert_eq!(p.function_containing(0x1010).unwrap().entry, 0x1010);
+        assert!(!t.contains(0x1010) && !f.contains(0x1020));
+    }
+
+    #[test]
+    fn a_branch_back_below_the_entry_stays_in_the_function() {
+        // A conditional branch to a block below the entry keeps it in the body, as before; so
+        // does a later jump back to it.
+        let below = vec![0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3];
+        // push rbp; mov rbp, rsp; test edi, edi; je 0x1010; jmp 0x1010
+        let hot = vec![0x55, 0x48, 0x89, 0xe5, 0x85, 0xff, 0x0f, 0x84, 0xe4, 0xff, 0xff, 0xff, 0xe9, 0xdf, 0xff, 0xff, 0xff];
+        let (_, p) = analyze(tk::program_facts::elf_with_functions(&[("start", vec![0xc3]), ("", below), ("hot", hot)]));
+        let h = p.function_by_name("hot").unwrap();
+        assert!(h.contains(0x1010), "{:?}", h.blocks);
+        assert!(h.tail_calls.is_empty(), "{:?}", h.tail_calls);
+        assert!(!p.functions.contains_key(&0x1010));
     }
 
     #[test]
