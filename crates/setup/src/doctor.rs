@@ -354,6 +354,10 @@ JAVA_HOME_OVERRIDE={}
         let check = ghidra_java(&engine_checks(&s, None)).cloned().unwrap();
         assert_eq!(check.status, CheckStatus::Warn, "{check:?}");
         assert!(check.message.contains(&over.display().to_string()) && check.message.contains(&set.display().to_string()), "{}", check.message);
+        // Spaces around `=` are allowed, as in any properties file.
+        std::fs::write(&props, format!("JAVA_HOME_OVERRIDE = {}\n", over.display())).unwrap();
+        let check = ghidra_java(&engine_checks(&s, None)).cloned().unwrap();
+        assert!(check.message.contains(&over.display().to_string()), "{}", check.message);
         // An override that names no Java is ignored, as Ghidra's launcher does.
         std::fs::write(
             &props,
