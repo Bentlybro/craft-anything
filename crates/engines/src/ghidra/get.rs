@@ -106,6 +106,48 @@ fn point_at_java(props: &Path, java: &Path) -> Result<(), ToolError> {
     std::fs::write(props, lines.join("\n") + "\n").map_err(|e| ToolError::io(props.display(), e))
 }
 
+/// The Java Ghidra will run on, found the way its launcher looks: a working `JAVA_HOME_OVERRIDE`
+/// in its `support/launch.properties` first, then the `JAVA_HOME` it's started with, then a `java`
+/// on PATH.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhidraJava {
+    /// `JAVA_HOME_OVERRIDE` in Ghidra's launch.properties (a guided install writes it).
+    Override(PathBuf),
+    /// The `JAVA_HOME` Ghidra is started with: the one set for it (`configured`), or the one this
+    /// program was started with.
+    Home { dir: PathBuf, configured: bool },
+    /// A `java` on PATH.
+    OnPath(PathBuf),
+    /// The folder set as Ghidra's Java has no `bin/java`.
+    NotJava(PathBuf),
+    /// No Java at all.
+    Missing,
+}
+
+/// Which Java the Ghidra at `launcher` will run on. `configured` is the Java set for it
+/// (`Settings::ghidra_java`), `inherited` the `JAVA_HOME` this program has.
+pub fn java_in_use(launcher: &Path, configured: Option<&Path>, inherited: Option<&Path>) -> GhidraJava {
+    let props = launcher.parent().map(|d| d.join("launch.properties"));
+    let over = props
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| text.lines().filter_map(|l| l.trim().strip_prefix("JAVA_HOME_OVERRIDE=")).map(str::trim).rfind(|v| !v.is_empty()).map(PathBuf::from));
+    if let Some(dir) = over.filter(|d| has_java(d)) {
+        return GhidraJava::Override(dir);
+    }
+    match configured {
+        Some(dir) if has_java(dir) => return GhidraJava::Home { dir: dir.to_path_buf(), configured: true },
+        Some(dir) => return GhidraJava::NotJava(dir.to_path_buf()),
+        None => {}
+    }
+    if let Some(dir) = inherited.filter(|d| has_java(d)) {
+        return GhidraJava::Home { dir: dir.to_path_buf(), configured: false };
+    }
+    match crate::find_on_path(&[if cfg!(windows) { "java.exe" } else { "java" }]) {
+        Some(p) => GhidraJava::OnPath(p),
+        None => GhidraJava::Missing,
+    }
+}
+
 fn launcher(root: &Path) -> Option<PathBuf> {
     let names: &[&str] = if cfg!(windows) { &["analyzeHeadless.bat"] } else { &["analyzeHeadless"] };
     names.iter().map(|n| root.join("support").join(n)).find(|p| p.is_file())

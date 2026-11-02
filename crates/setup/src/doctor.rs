@@ -154,7 +154,8 @@ pub fn doctor(host: &Host, req: &DoctorRequest) -> DoctorReport {
 
     // Optional engines.
     if req.engines {
-        checks.extend(engine_checks(&craft_anything_engine::Settings::load()));
+        let java_home = std::env::var_os("JAVA_HOME").map(PathBuf::from);
+        checks.extend(engine_checks(&craft_anything_engine::Settings::load(), java_home.as_deref()));
     }
 
     // MCP self-test.
@@ -169,10 +170,12 @@ pub fn doctor(host: &Host, req: &DoctorRequest) -> DoctorReport {
     DoctorReport { healthy, checks }
 }
 
-/// One check per optional engine, and, when Ghidra is found, which Java it runs on: the one set for
-/// it (`engines.ghidra.java_home`, or the managed one), which needn't be the Java on PATH that
-/// `engine:java` reports.
-fn engine_checks(settings: &craft_anything_engine::Settings) -> Vec<Check> {
+/// One check per optional engine, and, when Ghidra is found, which Java it runs on, found the way
+/// its launcher looks ([`java_in_use`]): that needn't be the Java on PATH that `engine:java`
+/// reports. `inherited` is this program's `JAVA_HOME`.
+///
+/// [`java_in_use`]: craft_anything_engines::ghidra::get::java_in_use
+fn engine_checks(settings: &craft_anything_engine::Settings, inherited: Option<&Path>) -> Vec<Check> {
     let mut checks = Vec::new();
     for e in craft_anything_engines::ENGINES {
         let name = format!("engine:{}", e.id);
@@ -181,15 +184,36 @@ fn engine_checks(settings: &craft_anything_engine::Settings) -> Vec<Check> {
             None => Check::new(name, CheckStatus::Info, format!("{} not found (optional; {}).", e.name, e.needed_for)),
         });
     }
-    if settings.ghidra_launcher().is_some() {
+    if let Some(launcher) = settings.ghidra_launcher() {
+        use craft_anything_engines::ghidra::get::{GhidraJava, java_in_use};
         let name = "engine:ghidra-java";
-        checks.push(match (settings.ghidra_java(), settings.engine_path("java")) {
-            (Some(home), _) => Check::new(name, CheckStatus::Ok, format!("Ghidra runs on the Java in {}.", home.display())),
-            (None, Some(_)) => {
-                Check::new(name, CheckStatus::Info, "No Java is set for Ghidra, so it looks for its own (it needs a recent one; see engine:java).")
+        let set = settings.ghidra_java();
+        let fix = "Set Ghidra's Java folder in Settings → Engines, or install Java 21 or newer.";
+        checks.push(match java_in_use(&launcher, set.as_deref(), inherited) {
+            GhidraJava::Override(dir) => match set.filter(|s| *s != dir) {
+                Some(s) => Check::new(
+                    name,
+                    CheckStatus::Warn,
+                    format!(
+                        "Ghidra runs on the Java in {}, from JAVA_HOME_OVERRIDE in its launch.properties, not the one set for it ({}).",
+                        dir.display(),
+                        s.display()
+                    ),
+                )
+                .fix("Remove the JAVA_HOME_OVERRIDE line from Ghidra's support/launch.properties to use the Java set in Settings."),
+                None => Check::new(name, CheckStatus::Ok, format!("Ghidra runs on the Java in {} (from its launch.properties).", dir.display())),
+            },
+            GhidraJava::Home { dir, configured: true } => Check::new(name, CheckStatus::Ok, format!("Ghidra runs on the Java in {}.", dir.display())),
+            GhidraJava::Home { dir, configured: false } => {
+                Check::new(name, CheckStatus::Info, format!("No Java is set for Ghidra, so it runs on JAVA_HOME ({}).", dir.display()))
             }
-            (None, None) => Check::new(name, CheckStatus::Warn, "Ghidra is installed but no Java was found for it.")
-                .fix("Set Ghidra's Java folder in Settings → Engines, or install Java 21 or newer."),
+            GhidraJava::OnPath(p) => {
+                Check::new(name, CheckStatus::Info, format!("No Java is set for Ghidra, so it runs on {} from PATH (it needs Java 21 or newer).", p.display()))
+            }
+            GhidraJava::NotJava(dir) => {
+                Check::new(name, CheckStatus::Warn, format!("The Java folder set for Ghidra ({}) has no bin/java.", dir.display())).fix(fix)
+            }
+            GhidraJava::Missing => Check::new(name, CheckStatus::Warn, "Ghidra is installed but no Java was found for it.").fix(fix),
         });
     }
     checks
@@ -264,31 +288,82 @@ mod engine_check_tests {
         checks.iter().find(|c| c.name == "engine:ghidra-java")
     }
 
+    fn jdk(at: &Path) -> PathBuf {
+        std::fs::create_dir_all(at.join("bin")).unwrap();
+        std::fs::write(at.join("bin").join(if cfg!(windows) { "java.exe" } else { "java" }), "").unwrap();
+        at.to_path_buf()
+    }
+
     #[test]
     fn doctor_names_the_java_ghidra_runs_on() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = craft_anything_engine::Settings::default();
         s.engines.store_dir = Some(dir.path().join("engines"));
         s.engines.only_configured = true;
-        assert!(ghidra_java(&engine_checks(&s)).is_none(), "nothing to say without Ghidra");
+        assert!(ghidra_java(&engine_checks(&s, None)).is_none(), "nothing to say without Ghidra");
 
         let ghidra = dir.path().join("ghidra");
         std::fs::create_dir_all(ghidra.join("support")).unwrap();
         std::fs::write(ghidra.join("support").join(if cfg!(windows) { "analyzeHeadless.bat" } else { "analyzeHeadless" }), "").unwrap();
-        s.engines.ghidra.install_dir = Some(ghidra);
-        let c = engine_checks(&s);
+        s.engines.ghidra.install_dir = Some(ghidra.clone());
+
+        // A folder set as Ghidra's Java that has no java in it is a warning, not a working Java.
+        let empty = dir.path().join("empty-jdk");
+        std::fs::create_dir_all(empty.join("bin")).unwrap();
+        s.engines.ghidra.java_home = Some(empty.clone());
+        let c = engine_checks(&s, None);
         let check = ghidra_java(&c).expect("a check once Ghidra is found");
         assert_eq!(check.status, CheckStatus::Warn, "{check:?}");
+        assert!(check.message.contains("has no bin/java"), "{}", check.message);
 
-        let jdk = dir.path().join("jdk-25");
-        std::fs::create_dir_all(jdk.join("bin")).unwrap();
-        s.engines.ghidra.java_home = Some(jdk.clone());
-        let c = engine_checks(&s);
+        // The Java set for it.
+        let set = jdk(&dir.path().join("jdk-25"));
+        s.engines.ghidra.java_home = Some(set.clone());
+        let c = engine_checks(&s, None);
         let check = ghidra_java(&c).unwrap();
         assert_eq!(check.status, CheckStatus::Ok);
-        assert!(check.message.contains(&jdk.display().to_string()), "{}", check.message);
+        assert!(check.message.contains(&set.display().to_string()), "{}", check.message);
         // engine:java still reports the Java on PATH (here: none, as only configured paths count).
         assert!(c.iter().any(|x| x.name == "engine:java" && x.status == CheckStatus::Info));
+
+        // None set: the JAVA_HOME this program has.
+        s.engines.ghidra.java_home = None;
+        let inherited = jdk(&dir.path().join("jdk-inherited"));
+        let check = ghidra_java(&engine_checks(&s, Some(&inherited))).cloned().unwrap();
+        assert_eq!(check.status, CheckStatus::Info);
+        assert!(check.message.contains("JAVA_HOME") && check.message.contains(&inherited.display().to_string()), "{}", check.message);
+
+        // JAVA_HOME_OVERRIDE in launch.properties wins over the rest, and doctor says so when it
+        // isn't the Java set for Ghidra.
+        let over = jdk(&dir.path().join("jdk-override"));
+        let props = ghidra.join("support").join("launch.properties");
+        std::fs::write(
+            &props,
+            format!(
+                "VMARGS=-Xshare:off
+JAVA_HOME_OVERRIDE={}
+",
+                over.display()
+            ),
+        )
+        .unwrap();
+        let check = ghidra_java(&engine_checks(&s, Some(&inherited))).cloned().unwrap();
+        assert_eq!(check.status, CheckStatus::Ok, "{check:?}");
+        assert!(check.message.contains(&over.display().to_string()), "{}", check.message);
+        s.engines.ghidra.java_home = Some(set.clone());
+        let check = ghidra_java(&engine_checks(&s, None)).cloned().unwrap();
+        assert_eq!(check.status, CheckStatus::Warn, "{check:?}");
+        assert!(check.message.contains(&over.display().to_string()) && check.message.contains(&set.display().to_string()), "{}", check.message);
+        // An override that names no Java is ignored, as Ghidra's launcher does.
+        std::fs::write(
+            &props,
+            "JAVA_HOME_OVERRIDE=/nowhere
+",
+        )
+        .unwrap();
+        let check = ghidra_java(&engine_checks(&s, None)).cloned().unwrap();
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains(&set.display().to_string()), "{}", check.message);
     }
 }
 
