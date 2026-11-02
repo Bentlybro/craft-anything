@@ -822,7 +822,7 @@ fn scan_function(ctx: &Ctx<'_>, entry: u64, known: &BTreeSet<u64>) -> Scan {
                     // reached another way, leaves it: a tail call to a function nothing else
                     // names (a stripped program's `frame_dummy` jumping to `register_tm_clones`,
                     // or a jump to a `.cold` part). Its target is analysed as a function of its own.
-                    let below = target < entry && !sc.leaders.contains(&target);
+                    let below = target < entry && !sc.leaders.contains(&target) && !sc.insns.contains_key(&target);
                     if target != entry && (known.contains(&target) || !img.is_exec(target) || below) {
                         sc.tails.push(target);
                     } else {
@@ -1339,6 +1339,23 @@ mod tests {
         assert!(h.contains(0x1010), "{:?}", h.blocks);
         assert!(h.tail_calls.is_empty(), "{:?}", h.tail_calls);
         assert!(!p.functions.contains_key(&0x1010));
+    }
+
+    #[test]
+    fn a_jump_into_a_block_below_the_entry_already_in_the_function_stays_in_it() {
+        // `mov eax, 1; ret` at 0x1010, reached first by `je 0x1010`; the later `jmp 0x1015`
+        // lands on its `ret`, which is already part of the body.
+        let below = vec![0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3];
+        // push rbp; mov rbp, rsp; test esi, esi; je 0x1035; test edi, edi; je 0x1010; ret; jmp 0x1015
+        let hot = vec![
+            0x55, 0x48, 0x89, 0xe5, 0x85, 0xf6, 0x0f, 0x84, 0x09, 0x00, 0x00, 0x00, 0x85, 0xff, 0x0f, 0x84, 0xdc, 0xff, 0xff, 0xff, 0xc3, 0xe9, 0xdb, 0xff,
+            0xff, 0xff,
+        ];
+        let (_, p) = analyze(tk::program_facts::elf_with_functions(&[("start", vec![0xc3]), ("", below), ("hot", hot)]));
+        let h = p.function_by_name("hot").unwrap();
+        assert!(h.contains(0x1010) && h.contains(0x1015), "{:?}", h.blocks);
+        assert!(h.tail_calls.is_empty(), "{:?}", h.tail_calls);
+        assert!(!p.functions.contains_key(&0x1015) && !p.functions.contains_key(&0x1010));
     }
 
     #[test]
