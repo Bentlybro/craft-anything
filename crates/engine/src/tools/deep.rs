@@ -189,45 +189,110 @@ fn user_renames(ctx: &mut Ctx<'_>, rebase: ghidra::Rebase) -> HashMap<String, St
     out
 }
 
+/// A piece of C text: an identifier, or anything else kept as it is (spaces, punctuation, numbers,
+/// a whole comment, a whole string or character literal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Piece<'a> {
+    Word(&'a str),
+    Text(&'a str),
+}
+
+/// Split C text into [`Piece`]s. A comment (`//…`, `/*…*/`) or a literal is one piece of text, so
+/// nothing inside it is renamed and a quote inside a comment doesn't start a literal.
+fn c_pieces(code: &str) -> Vec<Piece<'_>> {
+    let b = code.as_bytes();
+    let len = b.len();
+    let at = |i: usize| b.get(i).copied();
+    let ident = |c: Option<u8>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
+    let mut out = Vec::new();
+    // Pieces end only at ASCII bytes, so every slice below is on a character boundary.
+    fn push<'a>(out: &mut Vec<Piece<'a>>, code: &'a str, from: usize, to: usize, word: bool) {
+        if let Some(s) = code.get(from..to).filter(|s| !s.is_empty()) {
+            out.push(if word { Piece::Word(s) } else { Piece::Text(s) });
+        }
+    }
+    let (mut i, mut text_from) = (0usize, 0usize);
+    while i < len {
+        let c = at(i);
+        let next = at(i + 1);
+        i = if c == Some(b'/') && next == Some(b'/') {
+            (i + 2..len).find(|&j| at(j) == Some(b'\n')).unwrap_or(len)
+        } else if c == Some(b'/') && next == Some(b'*') {
+            (i + 2..len).find(|&j| at(j) == Some(b'*') && at(j + 1) == Some(b'/')).map_or(len, |j| j + 2)
+        } else if c == Some(b'"') || c == Some(b'\'') {
+            let mut j = i + 1;
+            while j < len && at(j) != c {
+                j += if at(j) == Some(b'\\') { 2 } else { 1 };
+            }
+            (j + 1).min(len)
+        } else if c.is_some_and(|c| c.is_ascii_alphabetic() || c == b'_') {
+            let end = (i..len).find(|&j| !ident(at(j))).unwrap_or(len);
+            push(&mut out, code, text_from, i, false);
+            push(&mut out, code, i, end, true);
+            text_from = end;
+            end
+        } else if ident(c) {
+            // A number: its digits and suffix (0x401140, 10UL) are text, not a name.
+            (i..len).find(|&j| !ident(at(j))).unwrap_or(len)
+        } else {
+            i + 1
+        };
+    }
+    push(&mut out, code, text_from, len, false);
+    out
+}
+
 /// `code` with every whole identifier that is a key of `renames` replaced by its value
-/// (`check_key` is replaced; `check_key_v2`, `my_check_key` and the text of a string or character
-/// literal aren't).
+/// (`check_key` is replaced; `check_key_v2`, `my_check_key`, comments and the text of a string or
+/// character literal aren't).
 fn rename_identifiers(code: &str, renames: &HashMap<String, String>) -> String {
     if renames.is_empty() {
         return code.to_string();
     }
-    let mut out = String::with_capacity(code.len());
-    let mut word = String::new();
-    let flush = |word: &mut String, out: &mut String| {
-        out.push_str(renames.get(word.as_str()).map_or(word.as_str(), String::as_str));
-        word.clear();
-    };
-    // Inside a literal: its quote, and whether the last character was an escaping backslash.
-    let mut literal: Option<(char, bool)> = None;
-    for c in code.chars() {
-        if let Some((quote, escaped)) = literal {
-            out.push(c);
-            literal = if escaped {
-                Some((quote, false))
-            } else if c == '\\' {
-                Some((quote, true))
-            } else if c == quote {
-                None
-            } else {
-                Some((quote, false))
-            };
-        } else if c.is_ascii_alphanumeric() || c == '_' {
-            word.push(c);
-        } else {
-            flush(&mut word, &mut out);
-            out.push(c);
-            if c == '"' || c == '\'' {
-                literal = Some((c, false));
-            }
+    c_pieces(code)
+        .into_iter()
+        .map(|p| match p {
+            Piece::Word(w) => renames.get(w).map_or(w, String::as_str),
+            Piece::Text(t) => t,
+        })
+        .collect()
+}
+
+/// Whether `s` can stand in C code as a name: letters, digits and `_`, not starting with a digit,
+/// and not a C keyword.
+fn is_c_name(s: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "auto", "bool", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum", "extern", "false", "float", "for", "goto",
+        "if", "inline", "int", "long", "register", "restrict", "return", "short", "signed", "sizeof", "static", "struct", "switch", "true", "typedef", "union",
+        "unsigned", "void", "volatile", "while",
+    ];
+    s.bytes().next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        && !KEYWORDS.contains(&s)
+}
+
+/// The renames that can go into this code, and the person's names that can't: one that isn't a C
+/// name (`handle // note` would turn the rest of a line into a comment), or one that another name
+/// in the code already is (it would then name two things). Only names that appear are considered.
+fn renames_for_code(texts: &[&str], renames: &HashMap<String, String>) -> (HashMap<String, String>, Vec<String>) {
+    let words: std::collections::HashSet<&str> = texts
+        .iter()
+        .flat_map(|t| c_pieces(t))
+        .filter_map(|p| match p {
+            Piece::Word(w) => Some(w),
+            Piece::Text(_) => None,
+        })
+        .collect();
+    let (mut ok, mut skipped) = (HashMap::new(), Vec::new());
+    for (from, to) in renames.iter().filter(|(from, _)| words.contains(from.as_str())) {
+        if is_c_name(to) && (!words.contains(to.as_str()) || to == from) {
+            ok.insert(from.clone(), to.clone());
+        } else if !skipped.contains(to) {
+            skipped.push(to.clone());
         }
     }
-    flush(&mut word, &mut out);
-    out
+    skipped.sort();
+    (ok, skipped)
 }
 
 fn build_evidence(
@@ -249,10 +314,13 @@ fn build_evidence(
     let line_count = df.pseudocode.as_deref().map(|p| p.lines().count()).unwrap_or(0);
     // The entry as every other tool gives it; Ghidra's own only when it differs.
     let entry = rebase.from_engine(df.entry);
-    // The names the person set, in place of Ghidra's own.
-    let name = rename_identifiers(&df.name, renames);
-    let signature = df.signature.as_deref().map(|s| rename_identifiers(s, renames));
-    let pseudocode = df.pseudocode.as_deref().map(|p| rename_identifiers(p, renames));
+    // The names the person set, in place of Ghidra's own: as set in the function field and the
+    // summary, and in the code wherever they can stand as C names.
+    let name = renames.get(&df.name).cloned().unwrap_or_else(|| df.name.clone());
+    let texts: Vec<&str> = [Some(df.name.as_str()), df.signature.as_deref(), df.pseudocode.as_deref()].into_iter().flatten().collect();
+    let (in_code, not_in_code) = renames_for_code(&texts, renames);
+    let signature = df.signature.as_deref().map(|s| rename_identifiers(s, &in_code));
+    let pseudocode = df.pseudocode.as_deref().map(|p| rename_identifiers(p, &in_code));
     let renamed = name != df.name || signature != df.signature || pseudocode != df.pseudocode;
     let mut result = serde_json::json!({
         "function": name,
@@ -288,6 +356,15 @@ fn build_evidence(
         e = e.limitation(Limitation::new(
             "user_names_applied",
             "the names you set replace Ghidra's own in this pseudo-C, matched by the name Ghidra gives each address (its FUN_/DAT_/LAB_ name or the program's symbol)",
+        ));
+    }
+    if !not_in_code.is_empty() {
+        e = e.limitation(Limitation::new(
+            "user_names_not_in_code",
+            format!(
+                "Ghidra's own name is kept in the code for these names you set, because they aren't C names or the code already uses them for something else: {}",
+                not_in_code.join(", ")
+            ),
         ));
     }
     if df.created {
@@ -440,6 +517,36 @@ mod tests {
     }
 
     #[test]
+    fn a_name_that_cant_stand_in_c_or_clashes_stays_out_of_the_code() {
+        let (elf, _) = tk::elf64(tk::ElfArch::X86_64, true);
+        let e = engine_with("prog", &elf);
+        with_deep(&e, Arc::new(Symbols));
+        let helper = call(&e, "native_function_show", json!({"function": "helper"}))["result"]["entry"].as_str().unwrap().to_string();
+        let main = call(&e, "native_function_show", json!({"function": "main"}))["result"]["entry"].as_str().unwrap().to_string();
+        let original = "int main(void) {\n  return helper(5) + helper_count + my_helper();\n}";
+        let not_in_code = |r: &serde_json::Value| {
+            r["limitations"].as_array().unwrap().iter().find(|x| x["code"] == "user_names_not_in_code").map(|x| x["message"].as_str().unwrap().to_string())
+        };
+        // Not a C name: the code keeps Ghidra's name, the function field and summary show the person's.
+        call(&e, "native_name_set", json!({"address": main, "name": "entry // note"}));
+        let r = call(&e, "native_function_pseudocode", json!({"function": "main"}));
+        assert_eq!(r["result"]["pseudo_code"], original, "{r}");
+        assert_eq!(r["result"]["function"], "entry // note");
+        assert_eq!(r["summary"], "Pseudo-C for entry // note from the Deep engine (3 lines).");
+        assert!(not_in_code(&r).is_some_and(|m| m.contains("entry // note")), "{r}");
+        // A name the code already uses for something else would name two things: left out too.
+        call(&e, "native_name_set", json!({"address": main, "name": ""}));
+        call(&e, "native_name_set", json!({"address": helper, "name": "helper_count"}));
+        let r = call(&e, "native_function_pseudocode", json!({"function": "main"}));
+        assert_eq!(r["result"]["pseudo_code"], original, "{r}");
+        assert!(not_in_code(&r).is_some_and(|m| m.contains("helper_count")), "{r}");
+        // A C keyword isn't a name either.
+        call(&e, "native_name_set", json!({"address": helper, "name": "return"}));
+        let r = call(&e, "native_function_pseudocode", json!({"function": "main"}));
+        assert_eq!(r["result"]["pseudo_code"], original, "{r}");
+    }
+
+    #[test]
     fn identifiers_are_renamed_whole() {
         let renames: HashMap<String, String> = [("check_key".to_string(), "verify".to_string()), ("FUN_00101160".to_string(), "go".to_string())].into();
         assert_eq!(
@@ -447,6 +554,12 @@ mod tests {
             "if (verify(x) && check_key_v2() && !my_check_key) go(\"check_key\");"
         );
         assert_eq!(rename_identifiers("check_key", &renames), "verify");
+        // Comments are kept as they are, and a quote inside one doesn't hide the code after it.
+        assert_eq!(
+            rename_identifiers("// don't check_key here\ncheck_key(); /* it's check_key */ check_key(0x1f);", &renames),
+            "// don't check_key here\nverify(); /* it's check_key */ verify(0x1f);"
+        );
+        assert_eq!(rename_identifiers("x = 10check_key; /* never closed check_key", &renames), "x = 10check_key; /* never closed check_key");
         assert_eq!(rename_identifiers(r#"puts("a \" check_key"); c = '\''; check_key();"#, &renames), r#"puts("a \" check_key"); c = '\''; verify();"#);
         assert_eq!(rename_identifiers("", &renames), "");
         assert_eq!(rename_identifiers("été check_key", &renames), "été verify");
