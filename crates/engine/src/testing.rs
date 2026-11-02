@@ -25,3 +25,11 @@ pub fn session() -> Session {
     s.settings.engines.only_configured = true;
     s
 }
+
+/// A [`session`] that finds the engines this computer has installed, for the `#[ignore]` tests
+/// that run a real one (a browser, Ghidra).
+pub fn live_session() -> Session {
+    let mut s = session();
+    s.settings.engines.only_configured = false;
+    s
+}

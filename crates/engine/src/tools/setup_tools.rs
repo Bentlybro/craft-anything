@@ -503,8 +503,11 @@ pub fn with_setting(settings: &Settings, key: &str, value: Value) -> Result<Sett
     if let Some(slot) = doc.pointer_mut(&pointer) {
         *slot = value;
     }
-    serde_json::from_value(doc)
-        .map_err(|e| ToolError::invalid(format!("That value doesn't fit {key}: {e}")).with_remediation("Check the type in settings_show."))
+    let mut next: Settings = serde_json::from_value(doc)
+        .map_err(|e| ToolError::invalid(format!("That value doesn't fit {key}: {e}")).with_remediation("Check the type in settings_show."))?;
+    // Not part of the saved settings, so the round trip above drops it: keep this session's.
+    next.engines.only_configured = settings.engines.only_configured;
+    Ok(next)
 }
 
 fn settings_set(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
@@ -642,5 +645,7 @@ mod tests {
         assert!(path.starts_with(&dir), "{} is under {}", path.display(), dir.display());
         assert!(std::fs::read_to_string(&path).unwrap().contains("auto_mode = false"));
         assert_ne!(dir, crate::settings::config_dir(), "never the computer's own folder");
+        assert!(e.session().settings.engines.only_configured, "changing a setting keeps the test session from finding this computer's engines");
+        assert_eq!(e.session().settings.ghidra_launcher(), None);
     }
 }

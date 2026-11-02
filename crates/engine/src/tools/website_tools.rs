@@ -1382,7 +1382,7 @@ mod tests {
             }
         });
         // In Clean room, a visitor's view: its evidence says so (#157).
-        let mut s = crate::testing::session();
+        let mut s = crate::testing::live_session();
         s.settings.deep_mode = false;
         let e = crate::Engine::new(s);
         let cli = || crate::CallOptions::new(crate::Caller::Cli).with_consent(crate::Consent::Granted);
@@ -1402,7 +1402,7 @@ mod tests {
     #[test]
     #[ignore]
     fn the_browsers_error_page_is_not_captured() {
-        let e = crate::Engine::new(crate::testing::session());
+        let e = crate::Engine::new(crate::testing::live_session());
         let cli = || crate::CallOptions::new(crate::Caller::Cli).with_consent(crate::Consent::Granted);
         // Nothing listens on port 1, so the browser shows its own error page.
         let _ = e.call("web_site_open", json!({"url": "http://127.0.0.1:1/"}), cli());
@@ -1427,7 +1427,7 @@ mod tests {
                 let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len());
             }
         });
-        let e = crate::Engine::new(crate::testing::session());
+        let e = crate::Engine::new(crate::testing::live_session());
         let cli = || crate::CallOptions::new(crate::Caller::Cli).with_consent(crate::Consent::Granted);
         e.call("web_site_open", json!({"url": url}), cli()).unwrap();
         let dir = tempfile::tempdir().unwrap();
