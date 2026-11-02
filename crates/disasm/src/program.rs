@@ -695,25 +695,34 @@ fn collect_strings(img: &Image, limits: &Limits) -> Vec<ProgString> {
     let mut out = Vec::new();
     let raw = matches!(bin.format, Format::Raw | Format::DosCom | Format::DosMz);
     let mut budget = limits.max_data_scan;
-    for s in &bin.sections {
+    // (name, address, file offset, bytes in the file) of each region to read strings from.
+    let regions: Vec<(&str, u64, Option<u64>, u64)> = if bin.sections.is_empty() {
+        // No section headers (firmware, or headers removed): every loaded segment, code ones too,
+        // as for a raw image, because read-only data often shares the code's segment then.
+        bin.segments.iter().filter(|g| g.file_size > 0).map(|g| (g.name.as_str(), g.addr, Some(g.file_offset), g.file_size)).collect()
+    } else {
+        bin.sections
+            .iter()
+            .filter(|s| !((s.exec && !raw) || !s.alloc || matches!(s.kind, "debug" | "bss")))
+            .map(|s| (s.name.as_str(), s.addr, s.file_offset, s.file_size))
+            .collect()
+    };
+    for (name, addr, file_offset, file_size) in regions {
         if out.len() >= limits.max_strings || budget == 0 {
             break;
         }
-        if (s.exec && !raw) || !s.alloc || matches!(s.kind, "debug" | "bss") {
-            continue;
-        }
-        let Some(off) = s.file_offset.and_then(|o| usize::try_from(o).ok()) else { continue };
-        let n = usize::try_from(s.file_size).unwrap_or(0).min(budget);
+        let Some(off) = file_offset.and_then(|o| usize::try_from(o).ok()) else { continue };
+        let n = usize::try_from(file_size).unwrap_or(0).min(budget);
         budget -= n;
         let Some(bytes) = img.data.get(off..off.saturating_add(n).min(img.data.len())) else { continue };
         for f in craft_anything_formats::strings::extract(bytes, 0, limits.string_min_len, limits.max_strings - out.len()) {
             out.push(ProgString {
-                addr: s.addr.wrapping_add(f.offset),
+                addr: addr.wrapping_add(f.offset),
                 file_offset: off as u64 + f.offset,
                 byte_len: f.byte_len,
                 encoding: f.encoding,
                 text: f.text,
-                section: s.name.clone(),
+                section: name.to_string(),
             });
         }
     }
@@ -1318,6 +1327,26 @@ mod tests {
             }
             assert_eq!(p.functions.len(), 3);
         }
+    }
+
+    #[test]
+    fn strings_are_found_in_the_segments_when_there_are_no_sections() {
+        let (mut elf, l) = tk::elf64(tk::ElfArch::X86_64, false);
+        let (_, sectioned) = analyze(elf.clone());
+        let hello = |p: &Program| p.strings.iter().find(|s| s.text == "Hello, Craft!").map(|s| (s.addr, s.file_offset));
+        assert_eq!(hello(&sectioned), Some((l.rodata_va, l.rodata_va - tk::ELF_BASE)));
+        // Remove the section header table: offset, count and name-table index.
+        elf[40..48].fill(0);
+        elf[60..64].fill(0);
+        let (img, p) = analyze(elf.clone());
+        assert!(img.bin.sections.is_empty());
+        assert_eq!(hello(&p), hello(&sectioned), "the same string at the same address");
+        let s = p.strings.iter().find(|s| s.text == "Hello, Craft!").unwrap();
+        assert!(img.bin.segments.iter().any(|g| g.name == s.section), "named after its segment: {}", s.section);
+        // A segment that claims more bytes than the file has is read up to the end, without a panic.
+        let phoff = usize::try_from(u64::from_le_bytes(elf[32..40].try_into().unwrap())).unwrap();
+        elf[phoff + 32..phoff + 40].copy_from_slice(&u64::MAX.to_le_bytes());
+        let _ = analyze(elf);
     }
 
     #[test]
