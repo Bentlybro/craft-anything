@@ -247,13 +247,14 @@ fn c_pieces(code: &str) -> Vec<Piece<'_>> {
 
 /// `code` with every whole identifier that is a key of `renames` replaced by its value
 /// (`check_key` is replaced; `check_key_v2`, `my_check_key`, a struct field `obj->check_key` or
-/// `s.check_key`, comments and the text of a string or character literal aren't).
+/// `s.check_key`, a qualified `A::check_key`, comments and the text of a string or character literal aren't).
 fn rename_identifiers(code: &str, renames: &HashMap<String, String>) -> String {
     if renames.is_empty() {
         return code.to_string();
     }
     let mut out = String::with_capacity(code.len());
-    // Whether the last text before a name ends in `.` or `->`: the name is then a field.
+    // Whether the last text before a name ends in `.`, `->` or `::`: the name is then a field or
+    // a member of a namespace or class, not the program-wide name being renamed.
     let mut field = false;
     for p in c_pieces(code) {
         match p {
@@ -263,7 +264,7 @@ fn rename_identifiers(code: &str, renames: &HashMap<String, String>) -> String {
             }
             Piece::Text(t) => {
                 let end = t.trim_end();
-                field = if end.is_empty() { field } else { end.ends_with('.') || end.ends_with("->") };
+                field = if end.is_empty() { field } else { end.ends_with('.') || end.ends_with("->") || end.ends_with("::") };
                 out.push_str(t);
             }
         }
@@ -630,6 +631,7 @@ mod tests {
             rename_identifiers("check_key(p->check_key, s.check_key, p -> check_key, s . check_key, 1.5);", &renames),
             "verify(p->check_key, s.check_key, p -> check_key, s . check_key, 1.5);"
         );
+        assert_eq!(rename_identifiers("A::check_key(); B::check_key(); check_key();", &renames), "A::check_key(); B::check_key(); verify();");
         // Comments are kept as they are, and a quote inside one doesn't hide the code after it.
         assert_eq!(
             rename_identifiers("// don't check_key here\ncheck_key(); /* it's check_key */ check_key(0x1f);", &renames),
