@@ -127,18 +127,11 @@ pub enum GhidraJava {
 /// Which Java the Ghidra at `launcher` will run on. `configured` is the Java set for it
 /// (`Settings::ghidra_java`), `inherited` the `JAVA_HOME` this program has.
 pub fn java_in_use(launcher: &Path, configured: Option<&Path>, inherited: Option<&Path>) -> GhidraJava {
+    // Ghidra's launcher follows a link to itself (one on PATH) and reads the properties beside
+    // the real one.
+    let launcher = std::fs::canonicalize(launcher).unwrap_or_else(|_| launcher.to_path_buf());
     let props = launcher.parent().map(|d| d.join("launch.properties"));
-    let over = props
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        // `KEY=value`, with or without spaces around the `=`, as Java reads a properties file.
-        .and_then(|text| {
-            text.lines()
-                .filter_map(|l| l.split_once('='))
-                .filter(|(k, _)| k.trim() == "JAVA_HOME_OVERRIDE")
-                .map(|(_, v)| v.trim())
-                .rfind(|v| !v.is_empty())
-                .map(PathBuf::from)
-        });
+    let over = props.and_then(|p| std::fs::read_to_string(p).ok()).and_then(|text| java_override(&text, &|k| std::env::var(k).ok()));
     if let Some(dir) = over.filter(|d| has_java(d)) {
         return GhidraJava::Override(dir);
     }
@@ -154,6 +147,30 @@ pub fn java_in_use(launcher: &Path, configured: Option<&Path>, inherited: Option
         Some(p) => GhidraJava::OnPath(p),
         None => GhidraJava::Missing,
     }
+}
+
+/// The `JAVA_HOME_OVERRIDE` in Ghidra's launch.properties text, read the way Ghidra does: `KEY=value`
+/// with or without spaces around the `=`, the first one with a value, and `${NAME}` replaced by
+/// that environment variable (`env`; an unset one becomes nothing).
+fn java_override(text: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let value =
+        text.lines().filter_map(|l| l.split_once('=')).filter(|(k, _)| k.trim() == "JAVA_HOME_OVERRIDE").map(|(_, v)| v.trim()).find(|v| !v.is_empty())?;
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(rest.get(..start).unwrap_or_default());
+        let after = rest.get(start + 2..).unwrap_or_default();
+        let Some(end) = after.find('}') else {
+            // No closing brace: the rest is taken as it is.
+            out.push_str(rest.get(start..).unwrap_or_default());
+            rest = "";
+            break;
+        };
+        out.push_str(&env(after.get(..end).unwrap_or_default()).unwrap_or_default());
+        rest = after.get(end + 1..).unwrap_or_default();
+    }
+    out.push_str(rest);
+    Some(PathBuf::from(out)).filter(|p| !p.as_os_str().is_empty())
 }
 
 fn launcher(root: &Path) -> Option<PathBuf> {
@@ -226,6 +243,37 @@ mod tests {
         touch(&jdk.join("bin").join(if cfg!(windows) { "java.exe" } else { "java" }));
         assert_eq!(java_home(None, &store), Some(jdk));
         assert_eq!(java_home(Some(d.path()), &store).as_deref(), Some(d.path()), "a Java the person set wins");
+    }
+
+    #[test]
+    fn the_java_override_is_read_as_ghidra_reads_it() {
+        let env = |k: &str| (k == "JDK_HOME").then(|| "/opt/jdk-25".to_string());
+        let read = |t: &str| java_override(t, &env);
+        assert_eq!(read("JAVA_HOME_OVERRIDE=/a\nJAVA_HOME_OVERRIDE=/b\n"), Some(PathBuf::from("/a")), "the first one");
+        assert_eq!(read("JAVA_HOME_OVERRIDE=\nJAVA_HOME_OVERRIDE = /b\n"), Some(PathBuf::from("/b")), "the first with a value");
+        assert_eq!(read("JAVA_HOME_OVERRIDE=${JDK_HOME}\n"), Some(PathBuf::from("/opt/jdk-25")));
+        assert_eq!(read("JAVA_HOME_OVERRIDE=${JDK_HOME}/x/${NOPE}y\n"), Some(PathBuf::from("/opt/jdk-25/x/y")));
+        assert_eq!(read("JAVA_HOME_OVERRIDE=${NOPE}\n"), None, "an unset variable leaves no path");
+        assert_eq!(read("JAVA_HOME_OVERRIDE=/a${JDK\n"), Some(PathBuf::from("/a${JDK")));
+        assert_eq!(read("VMARGS=-Xshare:off\n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launcher_reached_through_a_link_reads_the_real_installs_properties() {
+        let d = tempfile::tempdir().unwrap();
+        let support = d.path().join("ghidra").join("support");
+        let jdk = d.path().join("jdk");
+        std::fs::create_dir_all(&support).unwrap();
+        std::fs::create_dir_all(jdk.join("bin")).unwrap();
+        std::fs::write(jdk.join("bin").join("java"), "").unwrap();
+        std::fs::write(support.join("analyzeHeadless"), "").unwrap();
+        std::fs::write(support.join("launch.properties"), format!("JAVA_HOME_OVERRIDE={}\n", jdk.display())).unwrap();
+        let bin = d.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(support.join("analyzeHeadless"), bin.join("analyzeHeadless")).unwrap();
+        let canon = std::fs::canonicalize(&jdk).unwrap();
+        assert!(matches!(java_in_use(&bin.join("analyzeHeadless"), None, None), GhidraJava::Override(p) if p == jdk || p == canon));
     }
 
     #[test]
