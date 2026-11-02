@@ -496,6 +496,18 @@ fn signed_offset(a: u64, entry: u64) -> i128 {
     i128::from(a) - i128::from(entry)
 }
 
+/// An offset as a JSON number. JSON numbers here are 64-bit, and an offset can be anything from
+/// -(2^64 - 1) to 2^64 - 1, so one more than 2^63 below the entry is given as signed hex text.
+fn offset_json(off: i128) -> Value {
+    if let Ok(n) = i64::try_from(off) {
+        Value::from(n)
+    } else if let Ok(n) = u64::try_from(off) {
+        Value::from(n)
+    } else {
+        Value::from(format!("-{:#x}", off.unsigned_abs()))
+    }
+}
+
 fn native_function_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: AddrParams = parse_params(params)?;
     select_document(ctx, &p.document)?;
@@ -504,7 +516,9 @@ fn native_function_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
     let t = ctx.session.active()?;
     let f = st.prog.function_containing(a);
     let result = match f {
-        Some(f) => json!({"address": hex(a), "function": name_of(t, &st.prog, f.entry), "entry": hex(f.entry), "offset": signed_offset(a, f.entry)}),
+        Some(f) => {
+            json!({"address": hex(a), "function": name_of(t, &st.prog, f.entry), "entry": hex(f.entry), "offset": offset_json(signed_offset(a, f.entry))})
+        }
         None => {
             json!({"address": hex(a), "function": null, "reason": if st.img.is_exec(a) { "not inside any discovered function" } else { "not in executable code" }})
         }
@@ -730,6 +744,16 @@ mod tests {
     use super::super::native_common::test_support::*;
     use craft_anything_testkit as tk;
     use serde_json::json;
+
+    #[test]
+    fn every_offset_fits_its_json() {
+        use super::{offset_json, signed_offset};
+        assert_eq!(offset_json(signed_offset(0x1010, 0x1020)), json!(-16));
+        assert_eq!(offset_json(signed_offset(u64::MAX, 0)), json!(u64::MAX));
+        assert_eq!(offset_json(signed_offset(1 << 63, 0)), json!(1u64 << 63));
+        assert_eq!(offset_json(signed_offset(0, 1 << 63)), json!(i64::MIN));
+        assert_eq!(offset_json(signed_offset(0, u64::MAX)), json!("-0xffffffffffffffff"));
+    }
 
     #[test]
     fn function_find_gives_a_negative_offset_for_a_block_below_the_entry() {
