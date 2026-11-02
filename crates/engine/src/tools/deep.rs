@@ -246,19 +246,29 @@ fn c_pieces(code: &str) -> Vec<Piece<'_>> {
 }
 
 /// `code` with every whole identifier that is a key of `renames` replaced by its value
-/// (`check_key` is replaced; `check_key_v2`, `my_check_key`, comments and the text of a string or
-/// character literal aren't).
+/// (`check_key` is replaced; `check_key_v2`, `my_check_key`, a struct field `obj->check_key` or
+/// `s.check_key`, comments and the text of a string or character literal aren't).
 fn rename_identifiers(code: &str, renames: &HashMap<String, String>) -> String {
     if renames.is_empty() {
         return code.to_string();
     }
-    c_pieces(code)
-        .into_iter()
-        .map(|p| match p {
-            Piece::Word(w) => renames.get(w).map_or(w, String::as_str),
-            Piece::Text(t) => t,
-        })
-        .collect()
+    let mut out = String::with_capacity(code.len());
+    // Whether the last text before a name ends in `.` or `->`: the name is then a field.
+    let mut field = false;
+    for p in c_pieces(code) {
+        match p {
+            Piece::Word(w) => {
+                out.push_str(if field { w } else { renames.get(w).map_or(w, String::as_str) });
+                field = false;
+            }
+            Piece::Text(t) => {
+                let end = t.trim_end();
+                field = if end.is_empty() { field } else { end.ends_with('.') || end.ends_with("->") };
+                out.push_str(t);
+            }
+        }
+    }
+    out
 }
 
 /// Whether `s` can stand in C code as a name: letters, digits and `_`, not starting with a digit,
@@ -327,7 +337,16 @@ fn build_evidence(
     let entry = rebase.from_engine(df.entry);
     // The names the person set, in place of Ghidra's own: as set in the function field and the
     // summary, and in the code wherever they can stand as C names.
-    let name = renames.get(&df.name).map_or_else(|| df.name.clone(), |(n, _)| n.clone());
+    // By the function's address first: Ghidra may call it by a symbol the renames leave out (`sub_…`).
+    let name = ctx
+        .session
+        .active()?
+        .annotations
+        .names
+        .get(&entry)
+        .cloned()
+        .or_else(|| renames.get(&df.name).map(|(n, _)| n.clone()))
+        .unwrap_or_else(|| df.name.clone());
     let texts: Vec<&str> = [Some(df.name.as_str()), df.signature.as_deref(), df.pseudocode.as_deref()].into_iter().flatten().collect();
     let (in_code, not_in_code) = renames_for_code(&texts, renames);
     let signature = df.signature.as_deref().map(|s| rename_identifiers(s, &in_code));
@@ -565,6 +584,40 @@ mod tests {
         assert_eq!(r["result"]["pseudo_code"], original, "{r}");
     }
 
+    /// A deep engine that calls every function by a program symbol starting with `sub_`, which the
+    /// name matching leaves out.
+    struct SubNamed;
+
+    impl DeepDecompiler for SubNamed {
+        fn engine(&self) -> &'static str {
+            "ghidra"
+        }
+        fn engine_version(&self) -> Option<String> {
+            Some("test".into())
+        }
+        fn image_base(&self) -> Option<u64> {
+            Some(tk::ELF_BASE)
+        }
+        fn decompile(&self, entry: u64) -> Result<Option<DeepFunction>, ghidra::GhidraError> {
+            let pseudocode = Some("int sub_parse(void) { return 0; }".into());
+            Ok(Some(DeepFunction { entry, name: "sub_parse".into(), signature: None, pseudocode, created: false }))
+        }
+        fn list_functions(&self) -> Result<Vec<DeepFunction>, ghidra::GhidraError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn the_name_set_for_a_function_is_found_by_its_address() {
+        let (elf, l) = tk::elf64(tk::ElfArch::X86_64, true);
+        let e = engine_with("prog", &elf);
+        with_deep(&e, Arc::new(SubNamed));
+        call(&e, "native_name_set", json!({"address": format!("{:#x}", l.code_va), "name": "parse_args"}));
+        let r = call(&e, "native_function_pseudocode", json!({"function": "parse_args"}));
+        assert_eq!(r["result"]["function"], "parse_args", "{r}");
+        assert_eq!(r["summary"], "Pseudo-C for parse_args from the Deep engine (1 lines).");
+    }
+
     #[test]
     fn identifiers_are_renamed_whole() {
         let renames: HashMap<String, String> = [("check_key".to_string(), "verify".to_string()), ("FUN_00101160".to_string(), "go".to_string())].into();
@@ -573,6 +626,11 @@ mod tests {
             "if (verify(x) && check_key_v2() && !my_check_key) go(\"check_key\");"
         );
         assert_eq!(rename_identifiers("check_key", &renames), "verify");
+        // A struct field of the same name is another thing.
+        assert_eq!(
+            rename_identifiers("check_key(p->check_key, s.check_key, p -> check_key, s . check_key, 1.5);", &renames),
+            "verify(p->check_key, s.check_key, p -> check_key, s . check_key, 1.5);"
+        );
         // Comments are kept as they are, and a quote inside one doesn't hide the code after it.
         assert_eq!(
             rename_identifiers("// don't check_key here\ncheck_key(); /* it's check_key */ check_key(0x1f);", &renames),
