@@ -699,7 +699,8 @@ fn collect_strings(img: &Image, limits: &Limits) -> Vec<ProgString> {
     let regions: Vec<(&str, u64, Option<u64>, u64)> = if bin.sections.is_empty() {
         // No section headers (firmware, or headers removed): every loaded segment, code ones too,
         // as for a raw image, because read-only data often shares the code's segment then.
-        bin.segments.iter().filter(|g| g.file_size > 0).map(|g| (g.name.as_str(), g.addr, Some(g.file_offset), g.file_size)).collect()
+        // Bytes past the segment's size in memory are not mapped, so they are not read.
+        bin.segments.iter().map(|g| (g.name.as_str(), g.addr, Some(g.file_offset), g.file_size.min(g.size))).filter(|&(_, _, _, n)| n > 0).collect()
     } else {
         bin.sections
             .iter()
@@ -1343,10 +1344,20 @@ mod tests {
         assert_eq!(hello(&p), hello(&sectioned), "the same string at the same address");
         let s = p.strings.iter().find(|s| s.text == "Hello, Craft!").unwrap();
         assert!(img.bin.segments.iter().any(|g| g.name == s.section), "named after its segment: {}", s.section);
-        // A segment that claims more bytes than the file has is read up to the end, without a panic.
+        // A code segment that claims more file bytes than the file has, and than it has in memory:
+        // only the bytes it maps are read. Its header is the second one; the first is PT_INTERP.
         let phoff = usize::try_from(u64::from_le_bytes(elf[32..40].try_into().unwrap())).unwrap();
-        elf[phoff + 32..phoff + 40].copy_from_slice(&u64::MAX.to_le_bytes());
-        let _ = analyze(elf);
+        let load = phoff + 56;
+        assert_eq!(elf[load..load + 4], [1, 0, 0, 0], "PT_LOAD");
+        elf[load + 32..load + 40].copy_from_slice(&u64::MAX.to_le_bytes());
+        let (img, p) = analyze(elf);
+        let code = img.bin.segments.iter().find(|g| g.exec).unwrap();
+        assert!(code.file_size > code.size, "file size {} is clamped to the file, not to memory {}", code.file_size, code.size);
+        assert_eq!(hello(&p), hello(&sectioned));
+        for s in &p.strings {
+            let g = img.bin.segments.iter().find(|g| g.name == s.section).unwrap();
+            assert!(s.addr >= g.addr && s.addr + s.byte_len <= g.addr + g.size, "{s:?} is inside {} as mapped", g.name);
+        }
     }
 
     #[test]
