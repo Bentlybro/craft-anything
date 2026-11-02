@@ -490,6 +490,12 @@ fn native_function_instructions_list(ctx: &mut Ctx<'_>, params: Value) -> Result
     })
 }
 
+/// How far `a` is from a function's entry. A function's blocks can lie below its entry (a cold
+/// part, or code reached by a jump back), so the offset can be negative.
+fn signed_offset(a: u64, entry: u64) -> i128 {
+    i128::from(a) - i128::from(entry)
+}
+
 fn native_function_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: AddrParams = parse_params(params)?;
     select_document(ctx, &p.document)?;
@@ -498,7 +504,7 @@ fn native_function_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
     let t = ctx.session.active()?;
     let f = st.prog.function_containing(a);
     let result = match f {
-        Some(f) => json!({"address": hex(a), "function": name_of(t, &st.prog, f.entry), "entry": hex(f.entry), "offset": a - f.entry}),
+        Some(f) => json!({"address": hex(a), "function": name_of(t, &st.prog, f.entry), "entry": hex(f.entry), "offset": signed_offset(a, f.entry)}),
         None => {
             json!({"address": hex(a), "function": null, "reason": if st.img.is_exec(a) { "not inside any discovered function" } else { "not in executable code" }})
         }
@@ -506,7 +512,9 @@ fn native_function_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
     let summary = match f {
         Some(f) => {
             let name = name_of(t, &st.prog, f.entry).unwrap_or_else(|| f.name.clone());
-            format!("{a:#x} is inside {name} (+{:#x}).", a - f.entry)
+            let off = signed_offset(a, f.entry);
+            let sign = if off < 0 { "-" } else { "+" };
+            format!("{a:#x} is inside {name} ({sign}{:#x}).", off.unsigned_abs())
         }
         None => format!("{a:#x} isn't inside a known function."),
     };
@@ -722,6 +730,24 @@ mod tests {
     use super::super::native_common::test_support::*;
     use craft_anything_testkit as tk;
     use serde_json::json;
+
+    #[test]
+    fn function_find_gives_a_negative_offset_for_a_block_below_the_entry() {
+        // `hot` at 0x1020 branches back to an unnamed block at 0x1010 (`mov eax, 1; ret`), which
+        // becomes part of `hot`: the address is inside it, 0x10 bytes before its entry. `start`
+        // is only there to be the program's entry point.
+        let below = vec![0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3];
+        let hot = vec![0x55, 0x48, 0x89, 0xe5, 0x85, 0xff, 0x0f, 0x84, 0xe4, 0xff, 0xff, 0xff, 0x5d, 0xc3];
+        let elf = tk::program_facts::elf_with_functions(&[("start", vec![0xc3]), ("", below), ("hot", hot)]);
+        let e = engine_with("prog", &elf);
+        let r = call(&e, "native_function_find", json!({"address": "0x1010"}));
+        assert_eq!(r["result"]["function"], "hot", "{r}");
+        assert_eq!(r["result"]["offset"], -0x10, "{r}");
+        assert_eq!(r["summary"], "0x1010 is inside hot (-0x10).");
+        let r = call(&e, "native_function_find", json!({"address": "0x1024"}));
+        assert_eq!(r["result"]["offset"], 4);
+        assert_eq!(r["summary"], "0x1024 is inside hot (+0x4).");
+    }
 
     #[test]
     fn function_tools() {
